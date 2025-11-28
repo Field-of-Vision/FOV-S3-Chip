@@ -114,7 +114,12 @@ void loop() {
     lastCheck = millis();
     
     Serial.println("\n--- WiFi Status Check ---");
-    sendATCommand("AT+CIPSTATUS");
+    // Check if still connected to AP
+    sendATCommand("AT+CWJAP?");
+    delay(300);
+    
+    // Check IP address
+    sendATCommand("AT+CIPSTA?");
     delay(500);
   }
   
@@ -217,15 +222,15 @@ bool connectToWiFi() {
 
 // Function to check internet connectivity
 bool checkInternetConnection() {
-  // Ping Google DNS to test internet
+  // Test internet with DNS query to google.com
   Serial.println("[S3] Testing internet with DNS query...");
   sendATCommand("AT+CIPDOMAIN=\"google.com\"", 5000);
   
   delay(1000);
   
-  // Alternative: Check connection status
-  Serial.println("\n[S3] Checking connection status...");
-  sendATCommand("AT+CIPSTATUS");
+  // Query current WiFi connection info
+  Serial.println("\n[S3] Verifying WiFi connection...");
+  sendATCommand("AT+CWJAP?");
   
   return true; // If we got this far without errors, connection is good
 }
