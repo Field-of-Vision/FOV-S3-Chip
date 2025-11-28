@@ -1,0 +1,17 @@
+{
+    "EXCLUDE_DIRS": [
+        "node_modules",
+        "venv",
+        ".git",
+        "dist",
+        ".expo",
+        ".vscode",
+        ".idea",
+        "env",
+        ".pio",
+        "__pycache__"
+    ],
+    "EXCLUDE_FILES": [
+        "LICENSE"
+    ]
+}
