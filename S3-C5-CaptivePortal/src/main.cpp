@@ -26,8 +26,8 @@
 
 // SoftAP Configuration - Users will see this network name
 const char* SOFTAP_SSID = "FOV_Setup";        // Network name shown to users
-const char* SOFTAP_PASSWORD = "";              // Empty = open network (easier for setup)
-// const char* SOFTAP_PASSWORD = "fovsetup123"; // Or use password for security
+// const char* SOFTAP_PASSWORD = "";              // Empty = open network (easier for setup)
+const char* SOFTAP_PASSWORD = "fovsetup123"; // Or use password for security
 
 // Web server configuration
 const int WEBSERVER_PORT = 80;
