@@ -1,15 +1,19 @@
 #include <Arduino.h>
-#include "secrets.h"
 
 // ============================================
 // S3 to C5 AWS IoT MQTT Connection
 // ============================================
 // This firmware connects C5 to AWS IoT via AT commands
+// The C5 has AWS certificates pre-flashed in firmware
 
 // Pin definitions for C5 communication (UART2)
 #define C5_TX_PIN 35  // S3 GPIO35 (U2_TXD) -> C5 GPIO4 (U1_RXD)
 #define C5_RX_PIN 36  // S3 GPIO36 (U2_RXD) -> C5 GPIO5 (U1_TXD)
 #define C5_EN_PIN 1   // S3 GPIO1 controls C5 EN pin (power control)
+
+#define THINGNAME "aviva-fov-tablet-1"
+
+const char AWS_IOT_ENDPOINT[] = "a3lkzcadhi1yzr-ats.iot.eu-west-1.amazonaws.com";
 
 // UART configuration
 #define C5_BAUD_RATE 115200
@@ -29,7 +33,7 @@ HardwareSerial C5Serial(2); // UART2
 void sendATCommand(const char* command, unsigned long timeout = 2000);
 String waitForResponse(unsigned long timeout);
 bool connectToWiFi();
-bool uploadCertificates();
+bool configureCertificates();
 bool connectToAWSIoT();
 bool subscribeToTopic();
 void processCoordinates(String payload);
@@ -68,6 +72,12 @@ void setup() {
   sendATCommand("AT");
   delay(500);
   
+  // Test MQTT command support
+  Serial.println("\nStep 1.5: Verifying MQTT Support");
+  Serial.println("========================================\n");
+  sendATCommand("AT+MQTTUSERCFG=?", 2000);
+  delay(500);
+  
   // Connect to WiFi
   Serial.println("\nStep 2: Connecting to WiFi");
   Serial.println("========================================\n");
@@ -78,14 +88,14 @@ void setup() {
   Serial.println("✅ WiFi connected!\n");
   delay(2000);
   
-  // Upload certificates to C5
-  Serial.println("Step 3: Uploading AWS Certificates");
+  // Configure MQTT to use pre-flashed certificates
+  Serial.println("Step 3: Configuring MQTT with Pre-Flashed Certificates");
   Serial.println("========================================\n");
-  if (!uploadCertificates()) {
-    Serial.println("❌ Certificate upload failed!");
+  if (!configureCertificates()) {
+    Serial.println("❌ Certificate configuration failed!");
     return;
   }
-  Serial.println("✅ Certificates uploaded!\n");
+  Serial.println("✅ Certificates configured!\n");
   delay(2000);
   
   // Connect to AWS IoT
@@ -161,6 +171,8 @@ void sendATCommand(const char* command, unsigned long timeout) {
   if (response.length() > 0) {
     Serial.println("[C5 → S3]");
     Serial.println(response);
+  } else {
+    Serial.println("[C5 → S3] (no response)");
   }
 }
 
@@ -221,37 +233,42 @@ bool connectToWiFi() {
   return false;
 }
 
-// Function to upload certificates to C5
-bool uploadCertificates() {
-  Serial.println("[S3] Uploading certificates to C5...");
-  Serial.println("This may take a minute...\n");
+// Function to configure C5 to use pre-flashed certificates
+bool configureCertificates() {
+  Serial.println("[S3] Configuring MQTT with pre-flashed certificates...\n");
   
-  // Note: The C5 AT firmware may need to be configured to accept certificates
-  // For now, we'll use the MQTT client ID and configure SSL
+  // Configure MQTT user settings
+  // Parameters: AT+MQTTUSERCFG=<LinkID>,<scheme>,<"client_id">,<"username">,<"password">,<cert_key_ID>,<CA_ID>,<"path">
+  // LinkID: 0
+  // scheme: 1 = connect via TCP, enable SSL/TLS, verify server certificate (one-way authentication)
+  //         2 = connect via TCP, enable SSL/TLS, provide client certificate, verify server certificate (two-way authentication)
+  // For AWS IoT we need scheme 2 (mutual TLS authentication)
+  // cert_key_ID: 0 = use mqtt_client.crt and mqtt_client.key (pre-flashed)
+  // CA_ID: 0 = use mqtt_ca.crt (pre-flashed)
   
-  // Configure MQTT username (AWS IoT doesn't use username/password, but we set client ID)
-  char clientIdCmd[128];
-  snprintf(clientIdCmd, sizeof(clientIdCmd), "AT+MQTTUSERCFG=0,1,\"%s\",\"\",\"\",0,0,\"\"", THINGNAME);
+  char clientIdCmd[256];
+  snprintf(clientIdCmd, sizeof(clientIdCmd), 
+           "AT+MQTTUSERCFG=0,2,\"%s\",\"\",\"\",0,0,\"\"", 
+           THINGNAME);
   sendATCommand(clientIdCmd, 3000);
   delay(500);
   
   // Configure MQTT connection parameters
+  // Parameters: AT+MQTTCONNCFG=<LinkID>,<keepalive>,<disable_clean_session>,<"lwt_topic">,<"lwt_msg">,<lwt_qos>,<lwt_retain>
+  // keepalive: 120 seconds (AWS IoT supports up to 1200)
+  // disable_clean_session: 0 = clean session
   char mqttConnCmd[256];
   snprintf(mqttConnCmd, sizeof(mqttConnCmd), 
-           "AT+MQTTCONNCFG=0,0,600,1,\"\",\"\"");
+           "AT+MQTTCONNCFG=0,120,0,\"\",\"\",0,0");
   sendATCommand(mqttConnCmd, 3000);
   delay(500);
   
-  Serial.println("✓ MQTT configuration set");
-  
-  // Note: Certificate upload via AT commands is complex and depends on C5 AT firmware version
-  // Some versions support AT+SYSFLASH for certificate storage
-  // For this demo, we'll proceed assuming certificates are pre-configured or use alternative method
-  
-  Serial.println("⚠️ Note: Full certificate upload via AT commands requires");
-  Serial.println("   additional firmware support. For production, use:");
-  Serial.println("   - Pre-flash certificates to C5 filesystem");
-  Serial.println("   - Or use AT+SYSFLASH commands if supported");
+  Serial.println("✓ MQTT configuration complete");
+  Serial.println("✓ Using pre-flashed certificates from C5 firmware:");
+  Serial.println("  - Scheme: 2 (Mutual TLS authentication)");
+  Serial.println("  - CA: mqtt_ca.crt (Amazon Root CA 1)");
+  Serial.println("  - Client Cert: mqtt_client.crt");
+  Serial.println("  - Client Key: mqtt_client.key\n");
   
   return true;
 }
@@ -259,12 +276,14 @@ bool uploadCertificates() {
 // Function to connect to AWS IoT
 bool connectToAWSIoT() {
   // Build MQTT broker connection string
+  // Parameters: AT+MQTTCONN=<LinkID>,<"host">,<port>,<reconnect>
   char brokerCmd[256];
   snprintf(brokerCmd, sizeof(brokerCmd), 
            "AT+MQTTCONN=0,\"%s\",%d,1", 
            AWS_IOT_ENDPOINT, MQTT_PORT);
   
   Serial.printf("[S3] Connecting to: %s:%d\n", AWS_IOT_ENDPOINT, MQTT_PORT);
+  Serial.println("[S3] Using TLS with client certificate authentication...");
   
   // Clear buffer
   while(C5Serial.available()) {
@@ -277,6 +296,7 @@ bool connectToAWSIoT() {
   C5Serial.flush();
   
   // Wait for connection (can take 10-20 seconds for TLS handshake)
+  Serial.println("[S3] Waiting for TLS handshake... (this may take 20+ seconds)");
   String response = waitForResponse(30000);
   Serial.println(response);
   
@@ -285,11 +305,21 @@ bool connectToAWSIoT() {
     return true;
   }
   
+  // If failed, might be a certificate issue
+  if (response.indexOf("ERROR") >= 0 || response.indexOf("FAIL") >= 0) {
+    Serial.println("\n⚠️ Connection failed. Possible issues:");
+    Serial.println("  - Certificates might not be correctly flashed");
+    Serial.println("  - AWS IoT policy might not allow connection");
+    Serial.println("  - Thing name might be incorrect");
+    Serial.println("  - Network/firewall blocking port 8883");
+  }
+  
   return false;
 }
 
 // Function to subscribe to MQTT topic
 bool subscribeToTopic() {
+  // Parameters: AT+MQTTSUB=<LinkID>,<"topic">,<qos>
   char subCmd[128];
   snprintf(subCmd, sizeof(subCmd), "AT+MQTTSUB=0,\"%s\",1", MQTT_TOPIC);
   
