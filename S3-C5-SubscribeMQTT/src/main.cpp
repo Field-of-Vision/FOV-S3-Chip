@@ -3,6 +3,7 @@
 // ============================================
 // S3 MQTT Relay Test via C5 AT Commands
 // SIMPLIFIED - NO FLOW CONTROL
+// Sample firmmware for subscribing to MQTT topic via C5 module from firmware running on ESP32-S3
 // ============================================
 
 // Pin definitions for C5 communication (UART2)
