@@ -14,8 +14,9 @@
 const char* WIFI_SSID = "tim";
 const char* WIFI_PASSWORD = "password";
 
-// Test URLs - both HTTP
+// Test URLs - both HTTP and HTTPS
 const char* TEST_URL_HTTP = "http://joinpatch.s3.eu-west-1.amazonaws.com/firmware.bin";
+const char* TEST_URL_HTTPS = "https://joinpatch.s3.eu-west-1.amazonaws.com/firmware.bin";
 
 // Simple test URL that definitely works (Espressif's own test server)
 const char* TEST_URL_SIMPLE = "http://httpbin.org/bytes/100";
