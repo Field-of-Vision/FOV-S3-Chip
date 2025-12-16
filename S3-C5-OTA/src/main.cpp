@@ -1,14 +1,12 @@
 /*
  * ESP32-S3 Streaming OTA Update via C5 WiFi Module
  * 
- * Strategy: 
- *   1. Send AT+HTTPCGET to C5
- *   2. Parse +HTTPCGET:<size>, header
- *   3. Read binary data directly from UART
- *   4. Write to OTA partition as chunks arrive
- *   5. Verify and reboot
- * 
- * No custom C5 firmware needed - uses standard ESP-AT HTTP commands.
+ * IMPORTANT: AT+HTTPCGET returns data in CHUNKS, not all at once!
+ * Response format:
+ *   +HTTPCGET:<chunk_size>,<binary data>
+ *   +HTTPCGET:<chunk_size>,<binary data>
+ *   ... (repeats until complete)
+ *   OK
  */
 
 #include <Arduino.h>
@@ -20,19 +18,18 @@
 // ============================================
 // Pin Definitions
 // ============================================
-#define C5_TX_PIN   35  // S3 GPIO35 -> C5 RX
-#define C5_RX_PIN   36  // S3 GPIO36 -> C5 TX  
-#define C5_EN_PIN   1   // S3 GPIO1 -> C5 EN
-#define LED_PIN     38  // Onboard RGB LED (optional)
+#define C5_TX_PIN   35
+#define C5_RX_PIN   36
+#define C5_EN_PIN   1
 
 // ============================================
 // Configuration
 // ============================================
 #define C5_BAUD_RATE     115200
-#define OTA_WRITE_SIZE   4096      // Write to flash in 4KB chunks
-#define AT_TIMEOUT       10000     // 10s for normal AT commands
-#define HTTP_TIMEOUT     60000     // 60s for HTTP operations
-#define WIFI_TIMEOUT     20000     // 20s for WiFi connection
+#define OTA_WRITE_SIZE   4096
+#define AT_TIMEOUT       10000
+#define HTTP_TIMEOUT     120000   // 2 minutes for large files
+#define WIFI_TIMEOUT     20000
 
 // WiFi credentials - UPDATE THESE
 const char* WIFI_SSID = "tim";
@@ -50,10 +47,10 @@ HardwareSerial C5Serial(2);
 esp_ota_handle_t otaHandle = 0;
 const esp_partition_t* updatePartition = NULL;
 size_t totalFirmwareSize = 0;
-size_t bytesReceived = 0;
+size_t totalBytesReceived = 0;
 size_t bytesWritten = 0;
 
-// Write buffer - accumulate data before writing to flash
+// Write buffer
 uint8_t writeBuffer[OTA_WRITE_SIZE];
 size_t writeBufferPos = 0;
 
@@ -82,6 +79,22 @@ unsigned long stateStartTime = 0;
 String lastError = "";
 
 // ============================================
+// Chunked Download Parser State
+// ============================================
+enum ChunkParseState {
+    CHUNK_WAIT_PLUS,        // Waiting for '+' or 'O' (OK) or 'E' (ERROR)
+    CHUNK_PARSE_HEADER,     // Parsing "+HTTPCGET:<size>,"
+    CHUNK_READ_DATA,        // Reading <size> bytes of binary
+};
+
+ChunkParseState chunkState = CHUNK_WAIT_PLUS;
+String headerBuffer = "";
+size_t chunkExpectedSize = 0;
+size_t chunkBytesRead = 0;
+bool downloadComplete = false;
+bool downloadError = false;
+
+// ============================================
 // Utility Functions
 // ============================================
 
@@ -92,10 +105,16 @@ void clearC5Buffer() {
 }
 
 void printProgress() {
-    if (totalFirmwareSize > 0) {
-        float percent = (float)bytesReceived / totalFirmwareSize * 100.0;
-        Serial.printf("\r[PROGRESS] %u / %u bytes (%.1f%%)    ", 
-                      bytesReceived, totalFirmwareSize, percent);
+    static unsigned long lastPrint = 0;
+    if (millis() - lastPrint > 500) {  // Print every 500ms
+        lastPrint = millis();
+        if (totalFirmwareSize > 0) {
+            float percent = (float)totalBytesReceived / totalFirmwareSize * 100.0;
+            Serial.printf("\r[PROGRESS] %u / %u bytes (%.1f%%)     ", 
+                          totalBytesReceived, totalFirmwareSize, percent);
+        } else {
+            Serial.printf("\r[PROGRESS] %u bytes received     ", totalBytesReceived);
+        }
     }
 }
 
@@ -106,9 +125,6 @@ void printPartitionInfo() {
     Serial.println("\n┌─────────────── Partition Info ───────────────┐");
     Serial.printf("│ Running:  %-36s │\n", running ? running->label : "Unknown");
     Serial.printf("│ Next OTA: %-36s │\n", next ? next->label : "None");
-    if (running) {
-        Serial.printf("│ Address:  0x%08lx  Size: %-15lu │\n", running->address, running->size);
-    }
     Serial.println("└───────────────────────────────────────────────┘");
 }
 
@@ -116,7 +132,6 @@ void printPartitionInfo() {
 // AT Command Functions
 // ============================================
 
-// Send AT command and wait for expected response
 bool sendATCommand(const char* cmd, const char* expected, unsigned long timeout = AT_TIMEOUT) {
     clearC5Buffer();
     
@@ -145,11 +160,10 @@ bool sendATCommand(const char* cmd, const char* expected, unsigned long timeout 
         yield();
     }
     
-    Serial.printf("[AT RX] TIMEOUT waiting for '%s'\n", expected);
+    Serial.printf("[AT RX] TIMEOUT\n");
     return false;
 }
 
-// Send AT command and get full response
 String sendATCommandGetResponse(const char* cmd, unsigned long timeout = AT_TIMEOUT) {
     clearC5Buffer();
     
@@ -191,18 +205,13 @@ bool beginOTA() {
     Serial.printf("[OTA] Target partition: %s at 0x%08lx (%lu bytes)\n",
                   updatePartition->label, updatePartition->address, updatePartition->size);
     
-    if (totalFirmwareSize > updatePartition->size) {
-        lastError = "Firmware too large for partition";
-        return false;
-    }
-    
     esp_err_t err = esp_ota_begin(updatePartition, totalFirmwareSize, &otaHandle);
     if (err != ESP_OK) {
         lastError = String("esp_ota_begin failed: ") + esp_err_to_name(err);
         return false;
     }
     
-    bytesReceived = 0;
+    totalBytesReceived = 0;
     bytesWritten = 0;
     writeBufferPos = 0;
     
@@ -211,6 +220,8 @@ bool beginOTA() {
 }
 
 bool writeToOTA(uint8_t* data, size_t len) {
+    if (len == 0) return true;
+    
     esp_err_t err = esp_ota_write(otaHandle, data, len);
     if (err != ESP_OK) {
         lastError = String("esp_ota_write failed: ") + esp_err_to_name(err);
@@ -233,7 +244,7 @@ bool finalizeOTA() {
         return false;
     }
     
-    Serial.printf("\n[OTA] Success! Wrote %u bytes\n", bytesWritten);
+    Serial.printf("\n[OTA] Success! Written %u bytes to flash\n", bytesWritten);
     return true;
 }
 
@@ -245,150 +256,135 @@ void abortOTA() {
 }
 
 // ============================================
-// HTTP Download State Machine
+// Chunked Download Parser
 // ============================================
 
-// States for parsing HTTP response
-enum DownloadState {
-    DL_WAIT_PLUS,           // Waiting for '+' of +HTTPCGET
-    DL_PARSE_HEADER,        // Parsing "+HTTPCGET:<size>,"
-    DL_READ_DATA,           // Reading binary data
-    DL_COMPLETE,            // Download complete
-    DL_ERROR                // Error occurred
-};
-
-DownloadState dlState = DL_WAIT_PLUS;
-String headerBuffer = "";
-size_t expectedDataSize = 0;
-
-void resetDownloadState() {
-    dlState = DL_WAIT_PLUS;
+void resetChunkParser() {
+    chunkState = CHUNK_WAIT_PLUS;
     headerBuffer = "";
-    expectedDataSize = 0;
-    bytesReceived = 0;
+    chunkExpectedSize = 0;
+    chunkBytesRead = 0;
+    downloadComplete = false;
+    downloadError = false;
+    totalBytesReceived = 0;
     writeBufferPos = 0;
 }
 
-// Debug buffer to capture what C5 returns
-String debugBuffer = "";
-bool debugMode = true;
-
-// Process incoming data from C5 during download
-// Returns true when download is complete
-bool processDownloadData() {
-    while (C5Serial.available()) {
-        uint8_t c = C5Serial.read();
-        
-        // Capture first 500 bytes for debugging
-        if (debugMode && debugBuffer.length() < 500) {
-            if (c >= 32 && c < 127) {
-                debugBuffer += (char)c;
-            } else {
-                debugBuffer += "[0x";
-                debugBuffer += String(c, HEX);
-                debugBuffer += "]";
-            }
-        }
-        
-        switch (dlState) {
-            case DL_WAIT_PLUS:
-                if (c == '+') {
-                    headerBuffer = "+";
-                    dlState = DL_PARSE_HEADER;
-                }
-                // Check for ERROR before we even see +HTTPCGET
-                if (c == 'E' || headerBuffer.length() > 0) {
-                    if (c == 'E') headerBuffer = "E";
-                    else if (headerBuffer.length() > 0 && headerBuffer.length() < 10) {
-                        headerBuffer += (char)c;
-                        if (headerBuffer.indexOf("ERROR") >= 0) {
-                            Serial.printf("\n[DEBUG] Raw response:\n%s\n", debugBuffer.c_str());
-                            lastError = "HTTP ERROR received";
-                            dlState = DL_ERROR;
-                            return true;
-                        }
-                        if (headerBuffer.length() >= 5 && headerBuffer.indexOf("ERROR") < 0) {
-                            headerBuffer = ""; // Reset if not ERROR
-                        }
-                    }
-                }
-                break;
-                
-            case DL_PARSE_HEADER:
+// Process one byte from the UART stream
+// Returns true when we need to write buffer to flash
+bool processChunkByte(uint8_t c) {
+    switch (chunkState) {
+        case CHUNK_WAIT_PLUS:
+            // Looking for '+' (start of +HTTPCGET), 'O' (OK), or 'E' (ERROR)
+            if (c == '+') {
+                headerBuffer = "+";
+                chunkState = CHUNK_PARSE_HEADER;
+            } else if (c == 'O') {
+                headerBuffer = "O";
+                // Could be "OK" - end of transfer
+            } else if (c == 'E') {
+                headerBuffer = "E";
+                // Could be "ERROR"
+            } else if (headerBuffer.length() > 0) {
                 headerBuffer += (char)c;
                 
-                // Check for error
-                if (headerBuffer.indexOf("ERROR") >= 0) {
-                    Serial.printf("\n[DEBUG] Raw response:\n%s\n", debugBuffer.c_str());
-                    lastError = "HTTP request failed";
-                    dlState = DL_ERROR;
-                    return true;
+                if (headerBuffer == "OK") {
+                    Serial.printf("\n[HTTP] Transfer complete - received OK\n");
+                    downloadComplete = true;
+                    return false;
+                } else if (headerBuffer.startsWith("ERROR") || headerBuffer.indexOf("ERROR") >= 0) {
+                    Serial.printf("\n[HTTP] Received ERROR\n");
+                    downloadError = true;
+                    lastError = "HTTP transfer error";
+                    return false;
+                } else if (headerBuffer.length() > 10) {
+                    // Not what we're looking for, reset
+                    headerBuffer = "";
                 }
-                
-                // Look for complete header: +HTTPCGET:<size>,
-                if (headerBuffer.startsWith("+HTTPCGET:") && c == ',') {
-                    // Parse size from header
-                    int colonIdx = headerBuffer.indexOf(':');
-                    int commaIdx = headerBuffer.indexOf(',');
-                    if (colonIdx > 0 && commaIdx > colonIdx) {
-                        String sizeStr = headerBuffer.substring(colonIdx + 1, commaIdx);
-                        expectedDataSize = sizeStr.toInt();
-                        
-                        Serial.printf("\n[HTTP] Starting download: %u bytes\n", expectedDataSize);
-                        
-                        if (expectedDataSize == 0) {
-                            lastError = "Invalid data size in response";
-                            dlState = DL_ERROR;
-                            return true;
-                        }
-                        
-                        // Verify against expected firmware size
-                        if (totalFirmwareSize > 0 && expectedDataSize != totalFirmwareSize) {
-                            Serial.printf("[WARN] Size mismatch: expected %u, got %u\n", 
-                                         totalFirmwareSize, expectedDataSize);
-                        }
-                        
-                        totalFirmwareSize = expectedDataSize;
-                        dlState = DL_READ_DATA;
+            }
+            // Ignore \r, \n, and other characters between chunks
+            break;
+            
+        case CHUNK_PARSE_HEADER:
+            headerBuffer += (char)c;
+            
+            // Look for complete header: +HTTPCGET:<size>,
+            if (headerBuffer.startsWith("+HTTPCGET:") && c == ',') {
+                // Parse size
+                int colonIdx = headerBuffer.indexOf(':');
+                int commaIdx = headerBuffer.indexOf(',');
+                if (colonIdx > 0 && commaIdx > colonIdx) {
+                    String sizeStr = headerBuffer.substring(colonIdx + 1, commaIdx);
+                    chunkExpectedSize = sizeStr.toInt();
+                    chunkBytesRead = 0;
+                    
+                    if (chunkExpectedSize > 0) {
+                        chunkState = CHUNK_READ_DATA;
+                    } else {
+                        // Invalid size, reset
+                        headerBuffer = "";
+                        chunkState = CHUNK_WAIT_PLUS;
                     }
                 }
-                
-                // Safety: don't let header buffer grow too large
-                if (headerBuffer.length() > 50) {
-                    headerBuffer = headerBuffer.substring(headerBuffer.length() - 20);
-                }
-                break;
-                
-            case DL_READ_DATA:
-                // Add byte to write buffer
-                writeBuffer[writeBufferPos++] = c;
-                bytesReceived++;
-                
-                // When buffer is full, write to OTA partition
-                if (writeBufferPos >= OTA_WRITE_SIZE) {
-                    if (!writeToOTA(writeBuffer, writeBufferPos)) {
-                        dlState = DL_ERROR;
-                        return true;
-                    }
-                    writeBufferPos = 0;
-                    printProgress();
-                }
-                
-                // Check if download is complete
-                if (bytesReceived >= expectedDataSize) {
-                    Serial.printf("\n[HTTP] Download complete: %u bytes received\n", bytesReceived);
-                    dlState = DL_COMPLETE;
-                    return true;
-                }
-                break;
-                
-            case DL_COMPLETE:
-            case DL_ERROR:
+            }
+            
+            // Safety: don't let header grow too large
+            if (headerBuffer.length() > 30) {
+                headerBuffer = "";
+                chunkState = CHUNK_WAIT_PLUS;
+            }
+            break;
+            
+        case CHUNK_READ_DATA:
+            // Add byte to write buffer
+            writeBuffer[writeBufferPos++] = c;
+            chunkBytesRead++;
+            totalBytesReceived++;
+            
+            // Check if we've read the entire chunk
+            if (chunkBytesRead >= chunkExpectedSize) {
+                // Chunk complete, go back to waiting for next chunk
+                headerBuffer = "";
+                chunkState = CHUNK_WAIT_PLUS;
+            }
+            
+            // Return true if buffer is full and needs flushing
+            if (writeBufferPos >= OTA_WRITE_SIZE) {
                 return true;
-        }
+            }
+            break;
     }
     
     return false;
+}
+
+// Process all available data from C5
+// Returns: 0 = continue, 1 = complete, -1 = error
+int processDownloadStream() {
+    while (C5Serial.available()) {
+        uint8_t c = C5Serial.read();
+        
+        bool needFlush = processChunkByte(c);
+        
+        if (needFlush) {
+            // Write buffer to OTA partition
+            if (!writeToOTA(writeBuffer, writeBufferPos)) {
+                return -1;  // Error
+            }
+            writeBufferPos = 0;
+            printProgress();
+        }
+        
+        if (downloadComplete) {
+            return 1;  // Success
+        }
+        
+        if (downloadError) {
+            return -1;  // Error
+        }
+    }
+    
+    return 0;  // Continue
 }
 
 // ============================================
@@ -400,14 +396,13 @@ void runStateMachine() {
         case STATE_INIT:
             Serial.println("\n╔════════════════════════════════════════════╗");
             Serial.println("║  ESP32-S3 Streaming OTA via C5 WiFi        ║");
+            Serial.println("║  (Chunked Transfer Support)                ║");
             Serial.println("╚════════════════════════════════════════════╝\n");
             
             printPartitionInfo();
             
-            // Mark current app as valid (for rollback support)
             esp_ota_mark_app_valid_cancel_rollback();
             
-            // Power on C5
             pinMode(C5_EN_PIN, OUTPUT);
             digitalWrite(C5_EN_PIN, HIGH);
             Serial.println("[INIT] C5 module powered ON");
@@ -418,9 +413,11 @@ void runStateMachine() {
             
         case STATE_WAIT_C5_BOOT:
             if (millis() - stateStartTime >= 3000) {
-                // Initialize UART
+                // Use larger RX buffer to prevent data loss during fast transfers
+                // Default is only 256 bytes - way too small!
+                C5Serial.setRxBufferSize(16384);  // 16KB RX buffer
                 C5Serial.begin(C5_BAUD_RATE, SERIAL_8N1, C5_RX_PIN, C5_TX_PIN);
-                Serial.printf("[INIT] UART2: TX=%d, RX=%d, Baud=%d\n", 
+                Serial.printf("[INIT] UART2: TX=%d, RX=%d, Baud=%d, RX Buffer=16KB\n", 
                               C5_TX_PIN, C5_RX_PIN, C5_BAUD_RATE);
                 delay(500);
                 clearC5Buffer();
@@ -432,11 +429,6 @@ void runStateMachine() {
             Serial.println("[STATE] Checking C5 communication...");
             if (sendATCommand("AT", "OK", 2000)) {
                 Serial.println("[OK] C5 responding");
-                
-                // Get firmware version
-                String gmr = sendATCommandGetResponse("AT+GMR", 3000);
-                Serial.printf("[INFO] C5 Firmware:\n%s\n", gmr.c_str());
-                
                 currentState = STATE_WIFI_CONNECT;
             } else {
                 lastError = "C5 not responding";
@@ -446,9 +438,7 @@ void runStateMachine() {
             
         case STATE_WIFI_CONNECT:
             Serial.println("[STATE] Connecting to WiFi...");
-            
             sendATCommand("AT+CWMODE=1", "OK", 2000);
-            
             {
                 char cmd[128];
                 snprintf(cmd, sizeof(cmd), "AT+CWJAP=\"%s\",\"%s\"", WIFI_SSID, WIFI_PASSWORD);
@@ -463,15 +453,9 @@ void runStateMachine() {
             break;
             
         case STATE_SNTP_SYNC:
-            Serial.println("[STATE] Syncing time (for HTTPS if needed)...");
+            Serial.println("[STATE] Syncing time...");
             sendATCommand("AT+CIPSNTPCFG=1,0,\"pool.ntp.org\"", "OK", 3000);
-            delay(2000);  // Give time for sync
-            
-            {
-                String timeResp = sendATCommandGetResponse("AT+CIPSNTPTIME?", 3000);
-                Serial.printf("[INFO] Time: %s", timeResp.c_str());
-            }
-            
+            delay(2000);
             currentState = STATE_GET_FILE_SIZE;
             break;
             
@@ -482,7 +466,6 @@ void runStateMachine() {
                 snprintf(cmd, sizeof(cmd), "AT+HTTPGETSIZE=\"%s\"", FIRMWARE_URL);
                 String response = sendATCommandGetResponse(cmd, HTTP_TIMEOUT);
                 
-                // Parse +HTTPGETSIZE:<size>
                 int idx = response.indexOf("+HTTPGETSIZE:");
                 if (idx >= 0) {
                     int endIdx = response.indexOf('\r', idx);
@@ -513,10 +496,10 @@ void runStateMachine() {
             
         case STATE_START_DOWNLOAD:
             Serial.println("[STATE] Starting firmware download...");
-            resetDownloadState();
+            Serial.println("[INFO] Data arrives in chunks - this is normal");
+            resetChunkParser();
             
             {
-                // Send the HTTP GET command
                 char cmd[256];
                 snprintf(cmd, sizeof(cmd), "AT+HTTPCGET=\"%s\"", FIRMWARE_URL);
                 
@@ -532,30 +515,37 @@ void runStateMachine() {
             break;
             
         case STATE_DOWNLOADING:
-            // Process incoming data
-            if (processDownloadData()) {
-                // Download finished (success or error)
-                if (dlState == DL_COMPLETE) {
+            {
+                int result = processDownloadStream();
+                
+                if (result == 1) {
+                    // Download complete
                     currentState = STATE_FLUSH_BUFFER;
-                } else {
+                } else if (result == -1) {
+                    // Error
                     abortOTA();
                     currentState = STATE_ERROR;
                 }
-            }
-            
-            // Timeout check
-            if (millis() - stateStartTime > HTTP_TIMEOUT + (totalFirmwareSize / 10)) {
-                // Dynamic timeout based on file size
-                lastError = "Download timeout";
-                abortOTA();
-                currentState = STATE_ERROR;
+                
+                // Timeout check (with generous margin for large files)
+                unsigned long elapsed = millis() - stateStartTime;
+                unsigned long dynamicTimeout = HTTP_TIMEOUT + (totalFirmwareSize / 5);  // ~5KB/s minimum
+                
+                if (elapsed > dynamicTimeout) {
+                    Serial.printf("\n[ERROR] Download timeout after %lu ms\n", elapsed);
+                    lastError = "Download timeout";
+                    abortOTA();
+                    currentState = STATE_ERROR;
+                }
+                
+                // Print progress periodically
+                printProgress();
             }
             break;
             
         case STATE_FLUSH_BUFFER:
             Serial.println("\n[STATE] Flushing remaining data...");
             
-            // Write any remaining data in buffer
             if (writeBufferPos > 0) {
                 if (!writeToOTA(writeBuffer, writeBufferPos)) {
                     abortOTA();
@@ -566,13 +556,27 @@ void runStateMachine() {
                 writeBufferPos = 0;
             }
             
+            // Verify we got all the data
+            Serial.printf("[INFO] Total received: %u / %u bytes\n", totalBytesReceived, totalFirmwareSize);
+            
+            if (totalFirmwareSize > 0 && totalBytesReceived < totalFirmwareSize) {
+                size_t missing = totalFirmwareSize - totalBytesReceived;
+                Serial.printf("[ERROR] Missing %u bytes (%.1f%%)!\n", 
+                              missing, (float)missing / totalFirmwareSize * 100.0);
+                Serial.println("[ERROR] Data was lost during transfer - UART buffer overflow?");
+                Serial.println("[HINT] Try: slower transfer, larger buffer, or chunked download with Range headers");
+                lastError = "Incomplete transfer - data lost";
+                abortOTA();
+                currentState = STATE_ERROR;
+                break;
+            }
+            
             currentState = STATE_OTA_FINALIZE;
             break;
             
         case STATE_OTA_FINALIZE:
             Serial.println("[STATE] Finalizing OTA update...");
             
-            // Consume any trailing data from C5 (like \r\nOK\r\n)
             delay(500);
             clearC5Buffer();
             
@@ -587,7 +591,7 @@ void runStateMachine() {
             Serial.println("\n╔════════════════════════════════════════════╗");
             Serial.println("║         OTA UPDATE SUCCESSFUL!             ║");
             Serial.println("╠════════════════════════════════════════════╣");
-            Serial.printf("║  Downloaded: %-28u bytes ║\n", bytesReceived);
+            Serial.printf("║  Downloaded: %-28u bytes ║\n", totalBytesReceived);
             Serial.printf("║  Written:    %-28u bytes ║\n", bytesWritten);
             Serial.println("║                                            ║");
             Serial.println("║  Rebooting in 3 seconds...                 ║");
@@ -598,7 +602,6 @@ void runStateMachine() {
             break;
             
         case STATE_IDLE:
-            // Do nothing - OTA not triggered
             break;
             
         case STATE_ERROR:
@@ -606,7 +609,7 @@ void runStateMachine() {
             Serial.println("║           OTA UPDATE FAILED                ║");
             Serial.println("╠════════════════════════════════════════════╣");
             Serial.printf("║  Error: %-34s ║\n", lastError.c_str());
-            Serial.printf("║  Received: %-31u bytes ║\n", bytesReceived);
+            Serial.printf("║  Received: %-31u bytes ║\n", totalBytesReceived);
             Serial.printf("║  Written:  %-31u bytes ║\n", bytesWritten);
             Serial.println("║                                            ║");
             Serial.println("║  Continuing with current firmware...       ║");
@@ -625,7 +628,6 @@ void setup() {
     Serial.begin(115200);
     delay(1000);
     
-    // Print current firmware info
     const esp_partition_t* running = esp_ota_get_running_partition();
     esp_app_desc_t app_desc;
     if (esp_ota_get_partition_description(running, &app_desc) == ESP_OK) {
@@ -639,6 +641,9 @@ void setup() {
 void loop() {
     runStateMachine();
     
-    // Small delay to prevent tight loop
-    delay(10);
+    // Only delay when not actively downloading
+    // During download, we need to process data as fast as possible
+    if (currentState != STATE_DOWNLOADING) {
+        delay(1);
+    }
 }
