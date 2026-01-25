@@ -6,11 +6,6 @@
 // This firmware connects C5 to AWS IoT via AT commands
 // The C5 has AWS certificates pre-flashed in firmware
 
-// ============================================
-// DEBUG MODE - Set to true for verbose diagnostics
-// ============================================
-#define DEBUG_MODE false  // Set to true for verbose diagnostics (adds ~30s)
-
 // Pin definitions for C5 communication (UART2)
 #define C5_TX_PIN 35  // S3 GPIO35 (U2_TXD) -> C5 GPIO4 (U1_RXD)
 #define C5_RX_PIN 36  // S3 GPIO36 (U2_RXD) -> C5 GPIO5 (U1_TXD)
@@ -38,6 +33,7 @@ HardwareSerial C5Serial(2); // UART2
 void sendATCommand(const char* command, unsigned long timeout = 2000);
 String waitForResponse(unsigned long timeout);
 bool connectToWiFi();
+bool connectToWiFiWithRetry(int maxRetries = 3);
 bool configureCertificates();
 bool connectToAWSIoT();
 bool subscribeToTopic();
@@ -46,110 +42,124 @@ void processCoordinates(String payload);
 void setup() {
   // Initialize USB Serial for debug output (UART0)
   Serial.begin(115200);
-  delay(500);  // Reduced from 1000ms
-
+  delay(1000);
+  
   Serial.println("\n\n========================================");
   Serial.println("ESP32-S3 AWS IoT MQTT via C5");
-  if (!DEBUG_MODE) Serial.println("[PRODUCTION MODE - Fast Connect]");
   Serial.println("========================================\n");
-
+  
   // Configure C5 power control pin
   pinMode(C5_EN_PIN, OUTPUT);
   digitalWrite(C5_EN_PIN, HIGH); // Enable C5
   Serial.println("[S3] C5 module powered ON");
-
-  delay(2000); // Wait for C5 to boot - required
-
+  
+  delay(2000); // Wait for C5 to boot
+  
   // Initialize UART2 for C5 communication
   C5Serial.begin(C5_BAUD_RATE, SERIAL_8N1, C5_RX_PIN, C5_TX_PIN);
-  Serial.printf("[S3] UART2 initialized: Baud=%d, TX=GPIO%d, RX=GPIO%d\n\n",
+  Serial.printf("[S3] UART2 initialized: Baud=%d, TX=GPIO%d, RX=GPIO%d\n\n", 
                 C5_BAUD_RATE, C5_TX_PIN, C5_RX_PIN);
-
-  delay(100);  // Reduced from 500ms
-
+  
+  delay(500);
+  
   // Clear any startup messages from C5
   while(C5Serial.available()) {
     C5Serial.read();
   }
-
-  // Test basic AT communication
-  Serial.println("Step 1: Testing AT Communication");
-  Serial.println("========================================\n");
-  sendATCommand("AT");
-
-  // Debug-only: Get firmware version info
-  if (DEBUG_MODE) {
-    Serial.println("\nStep 1.1: Getting Firmware Info");
-    Serial.println("========================================\n");
-    sendATCommand("AT+GMR", 3000);
-
-    // Test MQTT command support
-    Serial.println("\nStep 1.5: Verifying MQTT Support");
-    Serial.println("========================================\n");
-    sendATCommand("AT+MQTTUSERCFG=?", 2000);
-  }
   
-  // Connect to WiFi
+  // Test basic AT communication
+  // Serial.println("Step 1: Testing AT Communication");
+  // Serial.println("========================================\n");
+  // sendATCommand("AT");
+  // delay(500);
+
+  // Get firmware version info
+  // Serial.println("\nStep 1.1: Getting Firmware Info");
+  // Serial.println("========================================\n");
+  // sendATCommand("AT+GMR", 3000);
+  // delay(500);
+
+  // // Test MQTT command support
+  // Serial.println("\nStep 1.5: Verifying MQTT Support");
+  // Serial.println("========================================\n");
+  // sendATCommand("AT+MQTTUSERCFG=?", 2000);
+  // delay(500);
+  
+  // Connect to WiFi (with retry logic for production boards)
   Serial.println("\nStep 2: Connecting to WiFi");
   Serial.println("========================================\n");
-  if (!connectToWiFi()) {
-    Serial.println("WiFi connection failed!");
+  if (!connectToWiFiWithRetry(3)) {
+    Serial.println("WiFi connection failed after all retries!");
+    Serial.println("[S3] HARDWARE CHECK NEEDED:");
+    Serial.println("  1. Check power supply - add 100-470uF capacitor near C5 VCC");
+    Serial.println("  2. Check antenna area - no metal within 10mm");
+    Serial.println("  3. Move closer to router for testing");
     return;
   }
   Serial.println("WiFi connected!\n");
+  delay(2000);
 
   // CRITICAL: Sync time via SNTP - TLS will fail without correct time!
   Serial.println("Step 2.5: Syncing Time (CRITICAL for TLS!)");
   Serial.println("========================================\n");
   Serial.println("[S3] Setting up SNTP time sync...");
   sendATCommand("AT+CIPSNTPCFG=1,0,\"pool.ntp.org\",\"time.google.com\"", 5000);
-  delay(2000);  // Reduced from 3000ms - still need time for NTP sync
+  delay(3000);  // Wait for time sync
 
   Serial.println("\n[S3] Checking current time:");
   sendATCommand("AT+CIPSNTPTIME?", 3000);
+  delay(1000);
 
-  // Debug-only: Test network connectivity and latency
-  if (DEBUG_MODE) {
-    Serial.println("\nStep 2.6: Testing Network Connectivity");
-    Serial.println("========================================\n");
-    sendATCommand("AT+PING=\"8.8.8.8\"", 10000);  // Ping Google DNS
-    Serial.println("\nPinging AWS IoT endpoint (shows latency to Sydney):");
-    sendATCommand("AT+PING=\"a3lkzcadhi1yzr-ats.iot.ap-southeast-2.amazonaws.com\"", 15000);
-  }
+  // Test network connectivity and latency
+  // Serial.println("\nStep 2.6: Testing Network Connectivity");
+  // Serial.println("========================================\n");
+  // sendATCommand("AT+PING=\"8.8.8.8\"", 10000);  // Ping Google DNS
+  // delay(1000);
+  // Serial.println("\nPinging AWS IoT endpoint (shows latency to Sydney):");
+  // sendATCommand("AT+PING=\"a3lkzcadhi1yzr-ats.iot.ap-southeast-2.amazonaws.com\"", 15000);
+  // delay(2000);
 
-  // Debug-only: Check certificate/SSL status (reading certs adds ~30s)
-  if (DEBUG_MODE) {
-    Serial.println("\nStep 3: Checking Certificate Configuration");
-    Serial.println("========================================\n");
+  // Check certificate/SSL status
+  Serial.println("\nStep 3: Checking Certificate Configuration");
+  Serial.println("========================================\n");
 
-    // List all namespaces in mfg_nvs
-    Serial.println("[S3] Listing all PKI namespaces:");
-    sendATCommand("AT+SYSMFG?", 3000);
+  // List all namespaces in mfg_nvs
+  Serial.println("[S3] Listing all PKI namespaces:");
+  sendATCommand("AT+SYSMFG?", 3000);
+  delay(500);
 
-    // Read MQTT CA certificate info
-    Serial.println("\n[S3] Reading MQTT CA certificate (mqtt_ca namespace):");
-    sendATCommand("AT+SYSMFG=1,\"mqtt_ca\"", 3000);
+  // Read MQTT CA certificate info
+  Serial.println("\n[S3] Reading MQTT CA certificate (mqtt_ca namespace):");
+  sendATCommand("AT+SYSMFG=1,\"mqtt_ca\"", 3000);
+  delay(500);
 
-    // Read first 200 bytes of the CA cert to verify it's the right one
-    Serial.println("\n[S3] Reading first 200 bytes of mqtt_ca:");
-    sendATCommand("AT+SYSMFG=1,\"mqtt_ca\",\"mqtt_ca\",0,200", 5000);
+  // Read first 200 bytes of the CA cert to verify it's the right one
+  // Key name is "mqtt_ca" (same as namespace), NOT "mqtt_ca.0"
+  Serial.println("\n[S3] Reading first 200 bytes of mqtt_ca:");
+  sendATCommand("AT+SYSMFG=1,\"mqtt_ca\",\"mqtt_ca\",0,200", 5000);
+  delay(500);
 
-    // Read MQTT client certificate info
-    Serial.println("\n[S3] Reading MQTT client certificate (mqtt_cert namespace):");
-    sendATCommand("AT+SYSMFG=1,\"mqtt_cert\"", 3000);
+  // Read MQTT client certificate info
+  Serial.println("\n[S3] Reading MQTT client certificate (mqtt_cert namespace):");
+  sendATCommand("AT+SYSMFG=1,\"mqtt_cert\"", 3000);
+  delay(500);
 
-    // Read first 200 bytes of the client cert
-    Serial.println("\n[S3] Reading first 200 bytes of mqtt_cert:");
-    sendATCommand("AT+SYSMFG=1,\"mqtt_cert\",\"mqtt_cert\",0,200", 5000);
+  // Read first 200 bytes of the client cert
+  // Key name is "mqtt_cert" (same as namespace), NOT "mqtt_cert.0"
+  Serial.println("\n[S3] Reading first 200 bytes of mqtt_cert:");
+  sendATCommand("AT+SYSMFG=1,\"mqtt_cert\",\"mqtt_cert\",0,200", 5000);
+  delay(500);
 
-    // Read MQTT client key info
-    Serial.println("\n[S3] Reading MQTT client key (mqtt_key namespace):");
-    sendATCommand("AT+SYSMFG=1,\"mqtt_key\"", 3000);
+  // Read MQTT client key info
+  Serial.println("\n[S3] Reading MQTT client key (mqtt_key namespace):");
+  sendATCommand("AT+SYSMFG=1,\"mqtt_key\"", 3000);
+  delay(500);
 
-    // Read first 200 bytes of the client key
-    Serial.println("\n[S3] Reading first 200 bytes of mqtt_key:");
-    sendATCommand("AT+SYSMFG=1,\"mqtt_key\",\"mqtt_key\",0,200", 5000);
-  }
+  // Read first 200 bytes of the client key
+  // Key name is "mqtt_key" (same as namespace), NOT "mqtt_key.0"
+  Serial.println("\n[S3] Reading first 200 bytes of mqtt_key:");
+  sendATCommand("AT+SYSMFG=1,\"mqtt_key\",\"mqtt_key\",0,200", 5000);
+  delay(500);
 
   // Configure MQTT to use pre-flashed certificates
   Serial.println("\nStep 3.5: Configuring MQTT with Pre-Flashed Certificates");
@@ -159,7 +169,8 @@ void setup() {
     return;
   }
   Serial.println("Certificates configured!\n");
-
+  delay(2000);
+  
   // Connect to AWS IoT
   Serial.println("Step 4: Connecting to AWS IoT");
   Serial.println("========================================\n");
@@ -168,7 +179,8 @@ void setup() {
     return;
   }
   Serial.println("Connected to AWS IoT!\n");
-
+  delay(100);
+  
   // Subscribe to MQTT topic
   Serial.println("Step 5: Subscribing to Topic");
   Serial.println("========================================\n");
@@ -238,65 +250,31 @@ void sendATCommand(const char* command, unsigned long timeout) {
 }
 
 // Function to wait for response from C5
-// Optimized: exits early when complete response (OK/ERROR) is detected
 String waitForResponse(unsigned long timeout) {
   String response = "";
   unsigned long startTime = millis();
-
+  
   while (millis() - startTime < timeout) {
     if (C5Serial.available()) {
       char c = C5Serial.read();
       response += c;
-
-      // Early exit on complete response detection
-      if (response.endsWith("OK\r\n") ||
-          response.endsWith("ERROR\r\n") ||
-          response.endsWith("FAIL\r\n")) {
-        delay(50);  // Brief delay for any trailing data
-        while (C5Serial.available()) {
-          response += (char)C5Serial.read();
-        }
-        break;
-      }
+      // Reset timeout when receiving data
+      startTime = millis();
     }
   }
-
+  
   return response;
 }
 
-// Function to connect to WiFi
-// Optimized: checks if already connected to avoid unnecessary reconnection
+// Function to connect to WiFi (single attempt)
 bool connectToWiFi() {
   // Set WiFi mode to Station
   sendATCommand("AT+CWMODE=1");
+  delay(500);
 
-  // Check if already connected to the correct WiFi
-  Serial.println("[S3] Checking current WiFi status...");
-
-  // Clear buffer
-  while(C5Serial.available()) {
-    C5Serial.read();
-  }
-
-  C5Serial.print("AT+CWJAP?\r\n");
-  C5Serial.flush();
-  String statusResponse = waitForResponse(3000);
-  Serial.println(statusResponse);
-
-  // Check if already connected to our network
-  if (statusResponse.indexOf(WIFI_SSID) >= 0 && statusResponse.indexOf("OK") >= 0) {
-    Serial.println("[S3] Already connected to WiFi - skipping reconnection!");
-    sendATCommand("AT+CIPSTA?", 2000);
-    return true;
-  }
-
-  // Not connected or connected to wrong network - need to connect
-  Serial.println("[S3] Not connected - initiating WiFi connection...");
-
-  // Disconnect from any existing connection (only if needed)
-  if (statusResponse.indexOf("No AP") < 0) {
-    sendATCommand("AT+CWQAP", 2000);
-  }
+  // Disconnect from any existing connection
+  sendATCommand("AT+CWQAP");
+  delay(1000);
 
   // Build the connection command
   char connectCmd[128];
@@ -314,23 +292,107 @@ bool connectToWiFi() {
   C5Serial.print("\r\n");
   C5Serial.flush();
 
-  // Wait for connection (reduced from 20000ms)
-  String response = waitForResponse(15000);
+  // Wait for connection (can take 10-15 seconds)
+  String response = waitForResponse(20000);
   Serial.println(response);
 
-  // Check if connection was successful
-  if (response.indexOf("WIFI CONNECTED") >= 0 || response.indexOf("WIFI GOT IP") >= 0) {
-    sendATCommand("AT+CIPSTA?", 2000);
+  // Check for disconnect BEFORE checking connected
+  // This catches the case where WiFi connects then immediately disconnects
+  // Error codes: +CWJAP:1 = timeout, +CWJAP:2 = wrong password, etc.
+  if (response.indexOf("WIFI DISCONNECT") >= 0) {
+    Serial.println("[S3] ERROR: WiFi connected but then disconnected!");
+    Serial.println("[S3] This usually indicates a power supply issue.");
+    return false;
+  }
+
+  if (response.indexOf("+CWJAP:") >= 0) {
+    // Parse error code
+    int errorIdx = response.indexOf("+CWJAP:");
+    if (errorIdx >= 0) {
+      char errorCode = response.charAt(errorIdx + 7);
+      Serial.printf("[S3] ERROR: WiFi connection failed with code: %c\n", errorCode);
+      switch (errorCode) {
+        case '1':
+          Serial.println("[S3]   Code 1 = Connection timeout");
+          break;
+        case '2':
+          Serial.println("[S3]   Code 2 = Wrong password");
+          break;
+        case '3':
+          Serial.println("[S3]   Code 3 = Cannot find AP");
+          break;
+        case '4':
+          Serial.println("[S3]   Code 4 = Connection failed");
+          break;
+        default:
+          Serial.println("[S3]   Unknown error code");
+          break;
+      }
+    }
+    return false;
+  }
+
+  // Check for successful connection - WIFI GOT IP is more reliable than WIFI CONNECTED
+  // WIFI CONNECTED = association started, WIFI GOT IP = DHCP completed successfully
+  if (response.indexOf("WIFI GOT IP") >= 0) {
+    delay(1000);
+
+    // Verify we got a real IP (not 0.0.0.0)
+    sendATCommand("AT+CIPSTA?");
+
+    // Optional: Query RSSI for signal strength diagnosis
+    Serial.println("[S3] Checking WiFi signal strength:");
+    sendATCommand("AT+CWJAP?", 3000);
+
     return true;
   }
 
+  // If we only got WIFI CONNECTED but not GOT IP, that's a partial failure
+  if (response.indexOf("WIFI CONNECTED") >= 0) {
+    Serial.println("[S3] WARNING: WiFi associated but no IP assigned (DHCP failed)");
+    return false;
+  }
+
+  return false;
+}
+
+// Function to connect to WiFi with retry logic
+// Handles intermittent connection issues on production boards
+bool connectToWiFiWithRetry(int maxRetries) {
+  for (int attempt = 1; attempt <= maxRetries; attempt++) {
+    Serial.printf("\n[S3] ===== WiFi connection attempt %d/%d =====\n", attempt, maxRetries);
+
+    if (connectToWiFi()) {
+      Serial.printf("[S3] WiFi connected successfully on attempt %d\n", attempt);
+      return true;
+    }
+
+    if (attempt < maxRetries) {
+      Serial.println("[S3] Connection failed, retrying in 3 seconds...");
+      delay(3000);
+
+      // Reset the C5 module between retries for a clean slate
+      Serial.println("[S3] Resetting C5 module...");
+      digitalWrite(C5_EN_PIN, LOW);
+      delay(500);
+      digitalWrite(C5_EN_PIN, HIGH);
+      delay(2000);  // Wait for C5 to boot
+
+      // Clear any startup messages
+      while(C5Serial.available()) {
+        C5Serial.read();
+      }
+    }
+  }
+
+  Serial.printf("[S3] WiFi connection failed after %d attempts\n", maxRetries);
   return false;
 }
 
 // Function to configure C5 to use pre-flashed certificates
 bool configureCertificates() {
   Serial.println("[S3] Configuring MQTT with pre-flashed certificates...\n");
-
+  
   // Configure MQTT user settings
   // Parameters: AT+MQTTUSERCFG=<LinkID>,<scheme>,<"client_id">,<"username">,<"password">,<cert_key_ID>,<CA_ID>,<"path">
   // LinkID: 0
@@ -347,24 +409,26 @@ bool configureCertificates() {
   snprintf(clientIdCmd, sizeof(clientIdCmd),
            "AT+MQTTUSERCFG=0,5,\"%s\",\"\",\"\",0,0,\"\"",
            THINGNAME);
-  sendATCommand(clientIdCmd, 2000);  // Reduced from 3000ms
-
+  sendATCommand(clientIdCmd, 3000);
+  delay(500);
+  
   // Configure MQTT connection parameters
   // Parameters: AT+MQTTCONNCFG=<LinkID>,<keepalive>,<disable_clean_session>,<"lwt_topic">,<"lwt_msg">,<lwt_qos>,<lwt_retain>
   // keepalive: 120 seconds (AWS IoT supports up to 1200)
   // disable_clean_session: 0 = clean session
   char mqttConnCmd[256];
-  snprintf(mqttConnCmd, sizeof(mqttConnCmd),
+  snprintf(mqttConnCmd, sizeof(mqttConnCmd), 
            "AT+MQTTCONNCFG=0,120,0,\"\",\"\",0,0");
-  sendATCommand(mqttConnCmd, 2000);  // Reduced from 3000ms
-
+  sendATCommand(mqttConnCmd, 3000);
+  delay(500);
+  
   Serial.println("MQTT configuration complete");
   Serial.println("Using pre-flashed certificates from C5 firmware:");
   Serial.println("  - Scheme: 5 (Verify server cert + provide client cert)");
   Serial.println("  - CA: mqtt_ca.crt (Amazon Root CA 1)");
   Serial.println("  - Client Cert: mqtt_cert (mqtt_client.crt)");
   Serial.println("  - Client Key: mqtt_key (mqtt_client.key)\n");
-
+  
   return true;
 }
 
@@ -378,9 +442,7 @@ bool connectToAWSIoT() {
            AWS_IOT_ENDPOINT, MQTT_PORT);
 
   Serial.printf("[S3] Connecting to: %s:%d\n", AWS_IOT_ENDPOINT, MQTT_PORT);
-  if (DEBUG_MODE) {
-    Serial.printf("[S3] Command: %s\n", brokerCmd);
-  }
+  Serial.printf("[S3] Command: %s\n", brokerCmd);
   Serial.println("[S3] Using TLS with client certificate authentication...");
 
   // Clear buffer
@@ -393,9 +455,9 @@ bool connectToAWSIoT() {
   C5Serial.print("\r\n");
   C5Serial.flush();
 
-  // Wait for connection (reduced from 90s, TLS handshake typically completes in 60-80s)
-  Serial.println("[S3] Waiting for TLS handshake...");
-  String response = waitForResponse(70000);  // 70 seconds timeout (was 90s)
+  // Wait for connection - increased timeout for high-latency connections
+  Serial.println("[S3] Waiting for TLS handshake... (this may take 60+ seconds)");
+  String response = waitForResponse(90000);  // 90 seconds timeout
   Serial.println(response);
 
   // Check if connection was successful
@@ -413,11 +475,11 @@ bool connectToAWSIoT() {
 
     // Try to get more info about the error
     Serial.println("\n[S3] Checking MQTT state:");
-    sendATCommand("AT+MQTTCONN?", 2000);
+    sendATCommand("AT+MQTTCONN?", 3000);
 
     // Also check SSL error if available
     Serial.println("\n[S3] Checking for SSL/TLS errors:");
-    sendATCommand("AT+SYSMSG?", 2000);
+    sendATCommand("AT+SYSMSG?", 3000);
   }
 
   return false;
