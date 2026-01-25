@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pio boards:*)",
+      "Bash(findstr:*)",
+      "Bash(pio pkg:*)",
+      "Bash(pio run:*)",
+      "Bash(python -m esptool:*)",
+      "Bash(timeout /t 10)",
+      "Bash(mode)",
+      "Bash(python:*)"
+    ]
+  }
+}

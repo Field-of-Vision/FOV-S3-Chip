@@ -198,26 +198,47 @@ def print_cert_info():
     print("\n[0] Certificate Information:")
     print("=" * 50)
 
+    # Print first 200 chars of each cert for comparison with C5 output
+    print("\n  First 200 bytes of each cert (compare with C5 AT+SYSMFG output):")
+
+    try:
+        with open(CA_CERT, 'r') as f:
+            ca_content = f.read()
+        print(f"\n  CA Certificate ({CA_CERT}):")
+        print(f"  {ca_content[:200]}...")
+    except Exception as e:
+        print(f"  Error reading CA cert: {e}")
+
+    try:
+        with open(DEVICE_CERT, 'r') as f:
+            cert_content = f.read()
+        print(f"\n  Device Certificate ({DEVICE_CERT}):")
+        print(f"  {cert_content[:200]}...")
+    except Exception as e:
+        print(f"  Error reading device cert: {e}")
+
+    try:
+        with open(DEVICE_KEY, 'r') as f:
+            key_content = f.read()
+        print(f"\n  Device Key ({DEVICE_KEY}):")
+        print(f"  {key_content[:100]}...")
+    except Exception as e:
+        print(f"  Error reading device key: {e}")
+
     try:
         import subprocess
 
-        # Check CA cert
-        print(f"\n  CA Certificate ({CA_CERT}):")
+        # Check CA cert with openssl if available
+        print(f"\n  CA Certificate details:")
         result = subprocess.run(
             ['openssl', 'x509', '-in', CA_CERT, '-noout', '-subject', '-issuer', '-dates'],
             capture_output=True, text=True
         )
         if result.returncode == 0:
             print(f"  {result.stdout}")
-        else:
-            # Try with cleaned version
-            with open(CA_CERT, 'r') as f:
-                ca_content = f.read()
-            if ')EOF"' in ca_content:
-                print("    (Contains artifact, will be cleaned)")
 
         # Check device cert
-        print(f"\n  Device Certificate ({DEVICE_CERT}):")
+        print(f"\n  Device Certificate details:")
         result = subprocess.run(
             ['openssl', 'x509', '-in', DEVICE_CERT, '-noout', '-subject', '-issuer', '-dates'],
             capture_output=True, text=True
@@ -228,7 +249,7 @@ def print_cert_info():
     except FileNotFoundError:
         print("  openssl not found - skipping detailed cert info")
     except Exception as e:
-        print(f"  Error reading certs: {e}")
+        print(f"  Error: {e}")
 
 def main():
     print("=" * 60)
