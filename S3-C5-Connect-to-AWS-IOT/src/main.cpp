@@ -47,8 +47,11 @@ void setup() {
   Serial.println("ESP32-S3 AWS IoT MQTT via C5");
   Serial.println("========================================\n");
   
-  // Configure C5 power control pin
+  // Configure C5 power control pin and restart C5
   pinMode(C5_EN_PIN, OUTPUT);
+  digitalWrite(C5_EN_PIN, LOW);  // Disable C5 first
+  Serial.println("[S3] C5 module powered OFF (resetting...)");
+  delay(500);  
   digitalWrite(C5_EN_PIN, HIGH); // Enable C5
   Serial.println("[S3] C5 module powered ON");
   
