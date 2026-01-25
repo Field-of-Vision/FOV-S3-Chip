@@ -23,7 +23,7 @@ const char* WIFI_SSID = "tim";
 const char* WIFI_PASSWORD = "password";
 
 // AWS IoT MQTT settings
-const char* MQTT_TOPIC = "dalymount_IRL/pub";  // Topic to subscribe to
+const char* MQTT_TOPIC = "kia_AUS/pub";  // Topic to subscribe to
 const int MQTT_PORT = 8883;  // AWS IoT uses 8883 for MQTT over TLS
 
 // Create Serial2 object for C5 communication
