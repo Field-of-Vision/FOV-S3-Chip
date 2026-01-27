@@ -31,7 +31,7 @@
 #define WIFI_PASSWORD   "password"
 
 // Firmware URL (HTTP only, no HTTPS)
-#define FIRMWARE_URL    "http://joinpatch.s3.eu-west-1.amazonaws.com/firmware.bin"
+#define FIRMWARE_URL    "http://fov-ota-update-melbourne.s3.ap-southeast-2.amazonaws.com/c5firmware.bin"
 
 // ============ Globals ============
 
